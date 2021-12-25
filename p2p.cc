@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <iostream>
+#include <iomanip>
 #include <stdlib.h>
 #include <limits.h>
 #include <unistd.h>
@@ -14,6 +15,9 @@ using namespace std;
 
 #define STUN_PORT 19302
 #define STUN_ADDR "74.125.197.127"
+#define MAP_ADDR_ATTR 0x0001
+#define XOR_MAP_ADDR_ATTR 0x0020
+#define MAGIC_COOKIE 0x2112A442
 
 struct STUNRequestHeader {
     const unsigned short message_type;
@@ -23,13 +27,20 @@ struct STUNRequestHeader {
     const unsigned int tid_2;
     const unsigned int tid_3;
 
-    STUNRequestHeader(bool is_new=false, const unsigned short msg_length=0): 
+    STUNRequestHeader(const unsigned short msg_length=0): 
                                             message_type(htons(0x0001)),
-                                            message_length(is_new ? htons(msg_length) : htons(msg_length + 20)),
-                                            tid_0(is_new ? htons(0x2112A442) : htons(rand() % UINT_MAX)), 
-                                            tid_1(htons(rand() % UINT_MAX)),
-                                            tid_2(htons(rand() % UINT_MAX)),
-                                            tid_3(htons(rand() % UINT_MAX)) {}
+                                            message_length(htons(msg_length)),
+                                            tid_0(htonl(MAGIC_COOKIE)), 
+                                            tid_1(htonl(rand() % UINT_MAX)),
+                                            tid_2(htonl(rand() % UINT_MAX)),
+                                            tid_3(htonl(rand() % UINT_MAX)) {}
+};
+
+struct MappedAddressAttribute {
+    unsigned char pad;
+    unsigned char fam;
+    unsigned short port;
+    unsigned int addr;
 };
 
 class p2p
@@ -105,33 +116,70 @@ void p2p::send_stun()
         exit(1);
     }
 
-    STUNRequestHeader req = STUNRequestHeader(true);
+    STUNRequestHeader req = STUNRequestHeader();
     if (sizeof(req) != 20) {
         cerr << "Incorrect header size: " << sizeof(req) << endl;
         exit(1);
     }
 
-    cout << "Connected!" << endl;
+    // cout << "Connected!" << endl;
     send(stun_sock , &req, sizeof(req), 0);
 
-    char buffer[1024];
-    while (true) {
-        size_t num_read = read(stun_sock, buffer, 1024);
-        cout << num_read << endl;
-        for (size_t i = 0; i < num_read; i++) {
-            cout << buffer[i];
-        }
+    const size_t buf_size = 128;
+    unsigned char buf[buf_size];
+    size_t n_recvd;
+    if ((n_recvd = recv(stun_sock, &buf, buf_size, 0)) < 0) {
+        cerr << "Error in receiving from socket: " << errno << endl;
+        exit(1);
     }
+
+    // cout << "DUMP:" << endl;
+    // for (size_t i = 0; i < buf_size && i < n_recvd; i++) {
+    //     printf("%02x ", buf[i]);
+    // }
+    // cout << endl << endl;
+
+    STUNRequestHeader *res = (STUNRequestHeader*)buf;
+    if (ntohs(res->message_type) != 0x0101) {
+        cerr << "Did not receive a binding response" << endl;
+        exit(1);
+    }
+    cout << "STUN response length: " << ntohs(res->message_length) << " bytes" << endl;
+
+    // could check recvd tid against sent tid for completeness
+
+    unsigned short attr_type = ntohs(*(short *)(buf + 20));
+    bool is_xor = false;
+    if (attr_type == MAP_ADDR_ATTR) {
+        cout << "Received mapped address" << endl;
+        is_xor = false;
+    } else if (attr_type == XOR_MAP_ADDR_ATTR) {
+        cout << "Received XOR mapped address" << endl;
+        is_xor = true;
+    } else {
+        cerr << "Received unexpected attribute: " << std::hex << attr_type << endl;
+        exit(1);
+    }
+
+    unsigned short val_length = ntohs(*(short *)(buf + 22));
+    if (val_length != 0x0008) {
+        cerr << "Received unexpected val length: " << std::hex << val_length << endl;
+        exit(1);
+    }
+
+    MappedAddressAttribute *attr = (MappedAddressAttribute*)(buf + 24);
+    if (attr->fam != 0x01) {
+        cerr << "Not IPv4: " << std::hex << attr->fam << endl;
+        exit(1);
+    }
+
+    unsigned int mask = is_xor ? MAGIC_COOKIE : 0;
+    cout << dec << "Port: " << (ntohs(attr->port) ^ (mask >> 16)) << " Address: " << (ntohl(attr->addr) ^ mask) << endl;
 }
+
 #endif
 
 int main() {
-    cout << "Hello, world" << endl;
-    // STUNRequestHeader req = STUNRequestHeader(true);
-    // for (size_t i = 0; i < 20; i++) {
-    //     printf("%02x ",((unsigned char*)&req)[i]);
-    // }
-    printf("\n");
     p2p receiver;
     receiver.send_stun();
     return 0;
