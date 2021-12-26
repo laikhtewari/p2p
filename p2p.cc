@@ -58,7 +58,7 @@ class p2p
 };
 
 // receiver variant (rho)
-p2p::p2p() : sock(0)
+p2p::p2p()
 {
     send_stun(false);
 
@@ -103,6 +103,7 @@ p2p::p2p(const char *addr, uint16_t port)
 
 p2p::~p2p()
 {
+    close(sock);
 }
 
 void p2p::send_data(const void *data, size_t len)
