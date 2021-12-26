@@ -47,16 +47,21 @@ struct MappedAddressAttribute {
 class p2p
 {
     private:
-        int sock;
-        int setup_socket(int socket_type, uint16_t port, const char *addr);
+        int tx_sock;
+        int rx_sock;
+        int outgoing_socket(int socket_type, uint16_t port, const char *addr, int flags);
+        int incoming_socket(uint16_t port, unsigned int addr, int flags);
     public:
-        p2p(const char *addr, uint16_t port);
-        p2p();
         ~p2p();
+        void establish_outgoing(uint16_t port, const char *addr);
+        void establish_incoming(uint16_t port, unsigned int addr);
         void send_stun(bool verbose);
         void send_data(const void *data, size_t len);
+        size_t read_data(void *buf, size_t len);
+        int get_tx_sock() { return tx_sock; }
 };
 
+/*
 // receiver variant (rho)
 p2p::p2p()
 {
@@ -94,29 +99,37 @@ p2p::p2p()
     }
     
 }
+*/
 
+/*
 // sender variant (sigma)
 p2p::p2p(const char *addr, uint16_t port)
 {
     sock = setup_socket(SOCK_STREAM, port, addr);
 }
+*/
 
 p2p::~p2p()
 {
-    close(sock);
+    close(tx_sock);
+    close(rx_sock);
 }
 
 void p2p::send_data(const void *data, size_t len)
 {
-    if (send(sock, data, len, 0) < 0) {
+    if (send(tx_sock, data, len, 0) < 0) {
         cerr << "Failed to send, error " << errno << endl;
         exit(1);
     }
 }
 
+size_t p2p::read_data(void *buf, size_t len) {
+    return recv(rx_sock, buf, len, 0);
+}
+
 void p2p::send_stun(bool verbose)
 {
-    int stun_sock = setup_socket(SOCK_DGRAM, STUN_PORT, STUN_ADDR);
+    int stun_sock = outgoing_socket(SOCK_DGRAM, STUN_PORT, STUN_ADDR, 0);
 
     STUNRequestHeader req = STUNRequestHeader();
     if (sizeof(req) != 20) {
@@ -188,9 +201,9 @@ void p2p::send_stun(bool verbose)
     close(stun_sock);
 }
 
-int p2p::setup_socket(int socket_type, uint16_t port, const char *addr) {
+int p2p::outgoing_socket(int socket_type, uint16_t port, const char *addr, int flags) {
     int _sock;
-    if ((_sock = socket(AF_INET, socket_type, 0)) < 0) {
+    if ((_sock = socket(AF_INET, socket_type, flags)) < 0) {
         cerr << "Unable to create socket" << endl;
         exit(1);
     }
@@ -210,26 +223,102 @@ int p2p::setup_socket(int socket_type, uint16_t port, const char *addr) {
     return _sock;
 }
 
-#endif
-
-int main(int argc, char *argv[]) {
-    if (argc < 2 || !(strcmp(argv[1], "receive") == 0 || strcmp(argv[1], "send") == 0)) {
-        cout << "Please specify either receive or send" << endl;
+int p2p::incoming_socket(uint16_t port, unsigned int addr, int flags) {
+    int _sock;
+    if ((_sock = socket(AF_INET, SOCK_STREAM, flags)) == 0)
+    {
+        cerr << "Setting up socket failed" << endl; 
         exit(1);
     }
 
-    if (strcmp(argv[1], "receive") == 0) {
-        p2p _p2p;
-    } else {
-        if (argc < 4) {
-            cout << "Please specify address and port" << endl;
-            exit(1);
-        }
-        p2p _p2p(argv[2], strtol(argv[3], NULL, 10));
-        while (true) {
-            char *data = "Hello, world";
-            _p2p.send_data(data, strlen(data));
-        }
+    struct sockaddr_in cli_addr;
+    cli_addr.sin_family = AF_INET;
+    cli_addr.sin_addr.s_addr = addr;
+    cli_addr.sin_port = port;
+
+    if (bind(_sock, (struct sockaddr *)&cli_addr, sizeof(cli_addr)) < 0)
+    {
+        cerr << "Failed to bind socket" << endl;
+        exit(1);
     }
+
+    if (listen(_sock, 1) < 0) {
+        cerr << "Failed to set socket listening" << endl;
+        exit(1);
+    }
+    return _sock;
+}
+
+void p2p::establish_outgoing(uint16_t port, const char *addr) {
+    tx_sock = outgoing_socket(SOCK_STREAM, port, addr, SO_REUSEADDR);
+}
+
+void p2p::establish_incoming(uint16_t port, unsigned int addr) {
+    rx_sock = incoming_socket(port, addr, SO_REUSEADDR);
+}
+
+#endif
+
+int main(int argc, char *argv[]) {
+    p2p _p2p;
+    _p2p.send_stun(false);
+
+    string line;
+    struct sockaddr_in peer_addr;
+    peer_addr.sin_family = AF_INET;
+    
+    cout << "Enter peer address: ";
+    if (!getline(cin, line) || inet_pton(AF_INET, line.c_str(), &peer_addr.sin_addr) <= 0) {
+        cerr << "Unable to read address" << endl;
+        exit(1);
+    }
+    const char *peer_addr_str = line.c_str();
+
+    cout << "Enter peer port: ";
+    if (!getline(cin, line) || !(peer_addr.sin_port = htons(strtol(line.c_str(), NULL, 10)))) {
+        cerr << "Unable to read port" << endl;
+        exit(1);
+    }
+
+    _p2p.establish_outgoing(peer_addr.sin_port, peer_addr_str);
+    cout << "Successfully connected outbound socket!" << endl;
+
+    sockaddr_in priv;
+    socklen_t priv_size = sizeof(priv);
+    getsockname(_p2p.get_tx_sock(), (sockaddr *)&priv, &priv_size);
+
+    _p2p.establish_incoming(priv.sin_port, priv.sin_addr.s_addr);
+    cout << "Successfully connected inbound socket!" << endl;
+
+    char buf[1024];
+    string to_tx;
+    while (true) {
+        getline(cin, to_tx);
+        for (size_t i = 0; i < _p2p.read_data(buf, 1024); i++) {
+            cout << buf[i];
+        }
+        _p2p.send_data(to_tx.c_str(), to_tx.length());
+    }
+
+    cout << "Address: " << ntohl(peer_addr.sin_addr.s_addr) << " Port: " << ntohs(peer_addr.sin_port) << endl;
+
+    // if (argc < 2 || !(strcmp(argv[1], "receive") == 0 || strcmp(argv[1], "send") == 0)) {
+    //     cout << "Please specify either receive or send" << endl;
+    //     exit(1);
+    // }
+
+    // if (strcmp(argv[1], "receive") == 0) {
+    //     p2p _p2p;
+    // } else {
+    //     if (argc < 4) {
+    //         cout << "Please specify address and port" << endl;
+    //         exit(1);
+    //     }
+    //     p2p _p2p(argv[2], strtol(argv[3], NULL, 10));
+    //     while (true) {
+    //         char *data = "Hello, world";
+    //         _p2p.send_data(data, strlen(data));
+    //     }
+    // }
     return 0;
 }
